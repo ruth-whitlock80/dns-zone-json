@@ -99,10 +99,19 @@ $ dnsconv zone.txt --origin example.com.
 `A`, `AAAA`, `CNAME`, `MX`, `NS`, `TXT`. Anything else is a parse error
 rather than being silently dropped.
 
+Records can span multiple lines using parentheses, as in a multi-string
+TXT record:
+
+```
+dkim._domainkey IN TXT ( "v=DKIM1; k=rsa; "
+                          "p=abcdef..." )
+```
+
+Comments and blank lines inside the parentheses are handled the same way
+they are on a single line.
+
 ## Known limitations
 
-- No support for parenthesized multi-line records (`( ... )` spanning
-  several lines).
 - No `$INCLUDE`.
 - No `SOA`, `PTR`, `SRV`, or `CAA` yet.
 - An explicit per-record TTL does not become the new default for records

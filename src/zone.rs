@@ -1,11 +1,12 @@
 // BIND-style zone file parsing and writing.
 //
-// This is deliberately a subset of what BIND accepts: one record per line,
-// no parenthesized continuations across lines, no $INCLUDE. Those are real
-// gaps (see the README) but most hand-written and generated zone files
-// don't use them, and the awkward parts that remain -- owner name
-// inheritance, $ORIGIN, TXT quoting -- are exactly what trips up a naive
-// line-splitter, so that's what the tests below focus on.
+// This is deliberately a subset of what BIND accepts: parenthesized
+// multi-line records are supported, but $INCLUDE is not. That's a real
+// gap (see the README) but most hand-written and generated zone files
+// don't use it, and the awkward parts that remain -- owner name
+// inheritance, $ORIGIN, TXT quoting, line continuations -- are exactly
+// what trips up a naive line-splitter, so that's what the tests below
+// focus on.
 
 use crate::record::{RData, Record};
 use std::fmt;
@@ -31,21 +32,15 @@ pub fn parse_zone(input: &str, default_origin: &str) -> Result<Vec<Record>, Pars
     let mut last_name: Option<String> = None;
     let mut records = Vec::new();
 
-    for (i, raw_line) in input.lines().enumerate() {
-        let line_no = i + 1;
-        let trimmed_start = raw_line.trim_start();
-        if trimmed_start.is_empty() || trimmed_start.starts_with(';') {
-            continue;
-        }
-
-        let tokens = tokenize(raw_line).map_err(|e| ParseError { line: line_no, message: e })?;
+    for logical in join_continuations(input)? {
+        let tokens = tokenize(&logical.text).map_err(|e| ParseError { line: logical.line, message: e })?;
         if tokens.is_empty() {
             continue;
         }
 
         if tokens[0].eq_ignore_ascii_case("$ORIGIN") {
             let value = tokens.get(1).ok_or_else(|| ParseError {
-                line: line_no,
+                line: logical.line,
                 message: "$ORIGIN needs an argument".to_string(),
             })?;
             origin = normalize_origin(value);
@@ -53,24 +48,146 @@ pub fn parse_zone(input: &str, default_origin: &str) -> Result<Vec<Record>, Pars
         }
         if tokens[0].eq_ignore_ascii_case("$TTL") {
             let value = tokens.get(1).ok_or_else(|| ParseError {
-                line: line_no,
+                line: logical.line,
                 message: "$TTL needs an argument".to_string(),
             })?;
             let parsed: u32 = value.parse().map_err(|_| ParseError {
-                line: line_no,
+                line: logical.line,
                 message: format!("invalid $TTL value \"{}\"", value),
             })?;
             ttl = Some(parsed);
             continue;
         }
 
-        let starts_with_space = raw_line.starts_with(' ') || raw_line.starts_with('\t');
-        let record = parse_record_line(&tokens, starts_with_space, &origin, ttl, &mut last_name)
-            .map_err(|e| ParseError { line: line_no, message: e })?;
+        let record = parse_record_line(&tokens, logical.starts_with_space, &origin, ttl, &mut last_name)
+            .map_err(|e| ParseError { line: logical.line, message: e })?;
         records.push(record);
     }
 
     Ok(records)
+}
+
+// One line's worth of record, after joining any parenthesized continuation
+// lines it spans. `line` is the first physical line of the group, used for
+// error messages. `starts_with_space` reflects that first physical line,
+// since that's what decides whether the owner name is inherited.
+struct LogicalLine {
+    line: usize,
+    text: String,
+    starts_with_space: bool,
+}
+
+// Joins parenthesized continuations into single logical lines, stripping
+// comments as it goes. A `(` opens a continuation and a `)` closes it;
+// while a continuation is open, line breaks are treated as whitespace.
+// Parens and semicolons inside quoted strings don't count, matching how
+// tokenize() treats them within a single line.
+fn join_continuations(input: &str) -> Result<Vec<LogicalLine>, ParseError> {
+    let mut result = Vec::new();
+    let mut depth: i32 = 0;
+    let mut current = String::new();
+    let mut start_line: Option<usize> = None;
+    let mut starts_with_space = false;
+    let total_lines = input.lines().count();
+
+    for (i, raw_line) in input.lines().enumerate() {
+        let line_no = i + 1;
+        let content = strip_comment_track_parens(raw_line, &mut depth)
+            .map_err(|e| ParseError { line: line_no, message: e })?;
+        let trimmed = content.trim();
+
+        if start_line.is_none() {
+            if trimmed.is_empty() {
+                continue;
+            }
+            start_line = Some(line_no);
+            starts_with_space = raw_line.starts_with(' ') || raw_line.starts_with('\t');
+            current = trimmed.to_string();
+        } else if !trimmed.is_empty() {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(trimmed);
+        }
+
+        if depth == 0 {
+            result.push(LogicalLine {
+                line: start_line.take().unwrap(),
+                text: std::mem::take(&mut current),
+                starts_with_space,
+            });
+        }
+    }
+
+    if depth != 0 {
+        return Err(ParseError {
+            line: start_line.unwrap_or(total_lines),
+            message: "unterminated parenthesized record".to_string(),
+        });
+    }
+
+    Ok(result)
+}
+
+// Strips a `;` comment (unless inside quotes) and replaces unquoted `(`/`)`
+// with spaces while tracking nesting depth in `depth`. Quoted strings must
+// still close on the same physical line they open on.
+fn strip_comment_track_parens(line: &str, depth: &mut i32) -> Result<String, String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(chars.len());
+    let mut i = 0;
+    let n = chars.len();
+    let mut in_quote = false;
+
+    while i < n {
+        let c = chars[i];
+        if in_quote {
+            if c == '\\' && i + 1 < n {
+                out.push(c);
+                out.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                in_quote = false;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+
+        match c {
+            '"' => {
+                in_quote = true;
+                out.push(c);
+                i += 1;
+            }
+            ';' => break,
+            '(' => {
+                *depth += 1;
+                out.push(' ');
+                i += 1;
+            }
+            ')' => {
+                *depth -= 1;
+                if *depth < 0 {
+                    return Err("unmatched ')'".to_string());
+                }
+                out.push(' ');
+                i += 1;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+
+    if in_quote {
+        return Err("unterminated quoted string".to_string());
+    }
+
+    Ok(out)
 }
 
 pub fn write_zone(records: &[Record]) -> String {
@@ -407,6 +524,38 @@ mod tests {
                 name: "unterminated quoted string is an error",
                 origin: "example.com.",
                 input: "bad 300 IN TXT \"unterminated\n",
+                expect: Expect::Err,
+            },
+            Case {
+                name: "parenthesized continuation joins a multi-string TXT record across lines",
+                origin: "example.com.",
+                input: "dkim 300 IN TXT ( \"v=DKIM1; k=rsa; \"\n    \"p=abcdef\" )\n",
+                expect: Expect::Records(vec![Record {
+                    name: "dkim.example.com.".into(),
+                    ttl: 300,
+                    rdata: RData::Txt(vec!["v=DKIM1; k=rsa; ".into(), "p=abcdef".into()]),
+                }]),
+            },
+            Case {
+                name: "comments on continuation lines inside parens are stripped",
+                origin: ".",
+                input: "$ORIGIN example.com.\nmail 300 IN MX ( ; open\n    10         ; preference\n    mailhost   ; exchange\n)                ; close\n",
+                expect: Expect::Records(vec![Record {
+                    name: "mail.example.com.".into(),
+                    ttl: 300,
+                    rdata: RData::Mx { preference: 10, exchange: "mailhost.example.com.".into() },
+                }]),
+            },
+            Case {
+                name: "a record after an unmatched closing paren is an error",
+                origin: "example.com.",
+                input: "bad 300 IN A ) 203.0.113.1\n",
+                expect: Expect::Err,
+            },
+            Case {
+                name: "an unclosed opening paren at end of file is an error",
+                origin: "example.com.",
+                input: "dkim 300 IN TXT ( \"v=DKIM1\"\n",
                 expect: Expect::Err,
             },
         ]
